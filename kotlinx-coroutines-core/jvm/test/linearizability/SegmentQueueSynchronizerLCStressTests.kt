@@ -484,7 +484,7 @@ internal class ReadWriteMutexCounterLCStressTest {
     val m = ReadWriteMutex()
     var c = 0
 
-    @Operation(cancellableOnSuspension = true)
+    @Operation(cancellableOnSuspension = true, allowExtraSuspension = true)
     suspend fun inc(): Int = try {
         m.acquireWrite()
         c++
@@ -492,7 +492,7 @@ internal class ReadWriteMutexCounterLCStressTest {
         m.releaseWrite()
     }
 
-    @Operation(cancellableOnSuspension = true)
+    @Operation(cancellableOnSuspension = true, allowExtraSuspension = true)
     suspend fun get(): Int = try {
         m.acquireRead()
         c
@@ -591,10 +591,10 @@ class ReadWriteMutexSequential : VerifierState() {
 class ReadWriteMutexLCStressTest {
     private val m = ReadWriteMutex()
 
-    @Operation(cancellableOnSuspension = false)
+    @Operation(cancellableOnSuspension = false, allowExtraSuspension = true)
     suspend fun acquireRead() = m.acquireRead()
 
-    @Operation(cancellableOnSuspension = false)
+    @Operation(cancellableOnSuspension = false, allowExtraSuspension = true)
     suspend fun acquireWrite() = m.acquireWrite()
 
     @Operation(handleExceptionsAsResult = [IllegalStateException::class])
@@ -616,13 +616,13 @@ class ReadWriteMutexLCStressTest {
 
     @Test
     fun test() = ModelCheckingOptions()
-        .iterations(50)
+        .iterations(20)
         .actorsBefore(0)
         .actorsAfter(0)
         .threads(3)
         .actorsPerThread(2)
         .logLevel(LoggingLevel.INFO)
-        .minimizeFailedScenario(false)
+//        .minimizeFailedScenario(false)
         .invocationsPerIteration(100_000)
         .sequentialSpecification(ReadWriteMutexSequential::class.java)
         .check(this::class)
