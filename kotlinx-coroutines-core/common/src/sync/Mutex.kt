@@ -347,14 +347,24 @@ internal class MutexImpl(locked: Boolean) : Mutex, SelectClause2<Any?, Mutex> {
     }
 
     private class LockedQueue(
-        @JvmField var owner: Any
+        owner: Any,
     ) : LockFreeLinkedListHead() {
+        private val _owner = atomic(owner)
+        var owner: Any
+            get() = _owner.value
+            set(value) { _owner.value = value }
+
         override fun toString(): String = "LockedQueue[$owner]"
     }
 
     private abstract class LockWaiter(
-        @JvmField val owner: Any?
+        owner: Any?
     ) : LockFreeLinkedListNode(), DisposableHandle {
+        private val _owner = atomic(owner)
+        var owner: Any?
+            get() = _owner.value
+            set(value) { _owner.value = value }
+
         final override fun dispose() { remove() }
         abstract fun tryResumeLockWaiter(): Any?
         abstract fun completeResumeLockWaiter(token: Any)
