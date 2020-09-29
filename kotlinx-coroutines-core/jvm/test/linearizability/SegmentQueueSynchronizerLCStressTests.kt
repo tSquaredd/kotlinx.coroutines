@@ -15,13 +15,15 @@ import kotlinx.coroutines.sync.*
 import org.jetbrains.kotlinx.lincheck.*
 import org.jetbrains.kotlinx.lincheck.annotations.*
 import org.jetbrains.kotlinx.lincheck.annotations.Operation
-import org.jetbrains.kotlinx.lincheck.strategy.managed.modelchecking.*
+import org.jetbrains.kotlinx.lincheck.execution.*
+import org.jetbrains.kotlinx.lincheck.paramgen.*
 import org.jetbrains.kotlinx.lincheck.strategy.stress.*
 import org.jetbrains.kotlinx.lincheck.verifier.*
-import org.junit.*
-import java.lang.IllegalStateException
+import org.junit.Test
 import kotlin.coroutines.*
 import kotlin.reflect.*
+import kotlin.reflect.jvm.*
+import kotlin.test.*
 
 // This test suit serves two purposes. First of all, it tests the `SegmentQueueSynchronizer`
 // implementation under different use-cases and workloads. On the other side, this test suite
@@ -136,7 +138,7 @@ internal class ReadWriteMutex {
             // Is this writer the first one? Check whether there are other
             // writers waiting for the lock, an active one, or a concurrent
             // [releaseWrite] invocation is in progress.
-            if (ww != 0 || wla || wlrp) {
+            if (wla || wlrp) {
                 // Try to suspend and re-try the whole operation on failure.
                 var failed = false
                 suspendAtomicCancellableCoroutine<Unit> { cont ->
@@ -155,6 +157,18 @@ internal class ReadWriteMutex {
                 val wf = r.wf
                 val ar = r.ar
                 val wr = r.wr
+                if (wf) {
+                    // Try to suspend and re-try the whole operation on failure.
+                    var failed = false
+                    suspendAtomicCancellableCoroutine<Unit> { cont ->
+                        if (!sqsForWriters.suspend(cont)) {
+                            cont.resume(Unit)
+                            failed = true
+                        }
+                    }
+                    if (failed) continue@try_again
+                    return
+                }
                 assert(!wf) { "WF flag should not be set at this point: $this" }
                 assert(wr == 0) { "The number of waiting readers should be 0 when the WF flag is not set"}
                 if (R.compareAndSet(r, constructR(true, ar, wr))) {
@@ -191,10 +205,10 @@ internal class ReadWriteMutex {
         }
     }
 
-    fun tryAcquireWrite(): Boolean {
-        while (true) {
+    fun tryAcquireWrite(): Boolean { // TODO - does not work
+        try_again@while (true) {
             // Increment the number of waiting writers at first.
-            val w = W.getAndIncrement()
+            val w = W.getAndIncrement() // TODO: wrong idea, set wlrp at first
             val ww = w.ww
             val wla = w.wla
             val wlrp = w.wlrp
@@ -212,19 +226,19 @@ internal class ReadWriteMutex {
                 assert(!wf) { "WF flag should not be set at this point: $this" }
                 assert(wr == 0) { "The number of waiting readers should be 0 when the WF flag is not set"}
                 if (ar != 0) return false
-                if (R.compareAndSet(r, constructR(true, 0, 0))) {
-                        // Yes! The write lock is just acquired!
-                        // Update `W` correspondingly.
-                        W.update { w1 ->
-                            val ww1 = w1.ww
-                            val wla1 = w1.wla
-                            val wlrp1 = w1.wlrp
-                            val wrf1 = w1.wrf
-                            assert(ww1 > 0) { "WW should be greater than 0 at least because of this `acquireWrite` invocation" }
-                            assert(!wla1 && !wlrp1 && !wrf1) { "WLA, WLRP, and WRF flags should not be set here" }
-                            constructW(ww1 - 1, true, false, false)
-                        return true
+                if (R.compareAndSet(r, constructR(true, ar, wr))) {
+                    // Yes! The write lock is just acquired!
+                    // Update `W` correspondingly.
+                    W.update { w1 ->
+                        val ww1 = w1.ww
+                        val wla1 = w1.wla
+                        val wlrp1 = w1.wlrp
+                        val wrf1 = w1.wrf
+                        assert(ww1 > 0) { "WW should be greater than 0 at least because of this `acquireWrite` invocation" }
+                        assert(!wla1 && !wlrp1 && !wrf1) { "WLA, WLRP, and WRF flags should not be set here" }
+                        constructW(ww1 - 1, true, false, false)
                     }
+                    return true
                 }
             }
         }
@@ -243,40 +257,43 @@ internal class ReadWriteMutex {
             if (!R.compareAndSet(r, upd)) continue
             // Check whether the current reader is the last one,
             // and resume the first writer if the `WF` flag is set.
-            if (ra == 1 && wf) {
-                while (true) {
-                    // Either WLA, WLA or WLRP should be
-                    // non-zero when the WF flag is set.
-                    val w = W.value
-                    val ww = w.ww
-                    val wla = w.wla
-                    val wlrp = w.wlrp
-                    val wrf = w.wrf
-                    assert(!wla) { "There should be no active writer at this point" }
-                    assert(!wrf) { "The WRF flag cannot be set at this point" }
-                    // Is there still a concurrent [releaseWrite]?
-                    // Try to delegate the resumption work in this case.
-                    if (wlrp) {
-                        val updW = constructW(ww, false, true, true)
-                        if (W.compareAndSet(w, updW)) return
-                    } else {
-                        assert(ww > 0) { "At most one waiting writer should be registered ar this point" }
-                        // Try to set the `WLA` flag and decrement
-                        // the number of waiting writers.
-                        val updW = constructW(ww -1, true, false, false)
-                        if (!W.compareAndSet(w, updW)) continue
-                        // Try to resume the first waiting writer.
-                        if (sqsForWriters.resume(Unit)) return
-                        // The resumption fails. However, it can be
-                        // processed as a successful write lock
-                        // acquisition followed by a release
-                        // invocation.
-                        releaseWrite()
-                        return
-                    }
-                }
-            }
+            if (ra == 1 && wf) onLastReadRelease()
             return
+        }
+    }
+
+    // TODO rename me
+    private fun onLastReadRelease() {
+        while (true) {
+            // Either WLA, WLA or WLRP should be
+            // non-zero when the WF flag is set.
+            val w = W.value
+            val ww = w.ww
+            val wla = w.wla
+            val wlrp = w.wlrp
+            val wrf = w.wrf
+            assert(!wla) { "There should be no active writer at this point" }
+            assert(!wrf) { "The WRF flag cannot be set at this point" }
+            // Is there still a concurrent [releaseWrite]?
+            // Try to delegate the resumption work in this case.
+            if (wlrp) {
+                val updW = constructW(ww, false, true, true)
+                if (W.compareAndSet(w, updW)) return
+            } else {
+                assert(ww > 0) { "At most one waiting writer should be registered ar this point" }
+                // Try to set the `WLA` flag and decrement
+                // the number of waiting writers.
+                val updW = constructW(ww -1, true, false, false)
+                if (!W.compareAndSet(w, updW)) continue
+                // Try to resume the first waiting writer.
+                if (sqsForWriters.resume(Unit)) return
+                // The resumption fails. However, it can be
+                // processed as a successful write lock
+                // acquisition followed by a release
+                // invocation.
+                releaseWrite()
+                return
+            }
         }
     }
 
@@ -322,10 +339,11 @@ internal class ReadWriteMutex {
                     }
                     // Decrement the number of active readers
                     // on the number of failed resumptions.
-                    R.update { r1 ->
+                    val rUpd = R.updateAndGet { r1 ->
                         assert(!r1.wf) { "WF flag cannot be re-set while the WLRP is set" }
                         constructR(false, r1.ar - failedResumptions, r1.wr)
                     }
+                    if (rUpd.ar == 0 && rUpd.wf) onLastReadRelease()
                 }
                 break
             }
@@ -366,7 +384,7 @@ internal class ReadWriteMutex {
             if (ar == 0) acquired = true
             break
         }
-        // Phase 4. Re-set the WLRP flag and try to resume
+        // Phase 5. Re-set the WLRP flag and try to resume
         // the next waiting writer if the write lock is grabbed.
         while (true) {
             val w = W.value
@@ -470,13 +488,38 @@ internal class ReadWriteMutexTest : TestBase() {
         finish(9)
     }
 
-//    @Test
-    fun testSimpleReadAndWrite2() = runTest {
+    @Test
+    fun testTryAcquireWrite() = runTest {
         val m = ReadWriteMutex()
-        m.acquireWrite()
-        expect(1)
-        launch { m.acquireRead() }
+        m.acquireRead()
+        println(m)
+        assertFalse(m.tryAcquireWrite())
+        println(m)
+        m.releaseRead()
+        println(m)
+        assertTrue(m.tryAcquireWrite())
+    }
 
+    @Test
+    fun `acquireRead suspend after cancelled acquireWrite`() = runTest {
+        val m = ReadWriteMutex()
+        m.acquireRead()
+        val wJob = launch {
+            expect(1)
+            m.acquireWrite()
+            expectUnreached()
+        }
+        yield()
+        expect(2)
+        wJob.cancel()
+        val rJob = launch {
+            expect(3)
+            m.acquireRead()
+            expectUnreached()
+        }
+        yield()
+        rJob.cancel()
+        finish(4)
     }
 }
 
@@ -500,24 +543,23 @@ internal class ReadWriteMutexCounterLCStressTest {
         m.releaseRead()
     }
 
-    @StateRepresentation
-    fun stateRepresentation(): String = "$c+$m"
+//    @StateRepresentation
+//    fun stateRepresentation(): String = "$c+$m"
+//
+//    @Test
+//    fun test() = ModelCheckingOptions()
+//        .iterations(50)
+//        .actorsBefore(0)
+//        .actorsAfter(0)
+//        .threads(3)
+//        .actorsPerThread(3)
+//        .logLevel(LoggingLevel.INFO)
+//        .invocationsPerIteration(100_000)
+//        .sequentialSpecification(ReadWriteMutexCounterSequential::class.java)
+//        .check(this::class)
 
     @Test
-    fun test() = ModelCheckingOptions()
-        .iterations(50)
-        .actorsBefore(0)
-        .actorsAfter(0)
-        .threads(3)
-        .actorsPerThread(3)
-        .logLevel(LoggingLevel.INFO)
-        .invocationsPerIteration(100_000)
-        .hangingDetectionThreshold(30)
-        .sequentialSpecification(ReadWriteMutexCounterSequential::class.java)
-        .check(this::class)
-
-    @Test
-    fun test2() = StressOptions()
+    fun test() = StressOptions()
         .actorsBefore(0)
         .actorsAfter(0)
         .threads(3)
@@ -536,13 +578,109 @@ class ReadWriteMutexCounterSequential : VerifierState() {
     override fun extractState() = c
 }
 
+class ReadWriteMutexLCStressTest {
+    private val m = ReadWriteMutex()
+    private val readLockAcquired = IntArray(6)
+    private val writeLockAcquired = BooleanArray(6)
+
+    @Operation(cancellableOnSuspension = true, allowExtraSuspension = true)
+    suspend fun acquireRead(@Param(gen = ThreadIdGen::class) threadId: Int) {
+        m.acquireRead()
+        readLockAcquired[threadId]++
+    }
+
+    @Operation
+    fun tryAcquireRead(@Param(gen = ThreadIdGen::class) threadId: Int) = m.tryAcquireRead().also { acquired ->
+        if (acquired) {
+            readLockAcquired[threadId]++
+        }
+    }
+
+    @Operation(cancellableOnSuspension = false, allowExtraSuspension = true)
+    suspend fun acquireWrite(@Param(gen = ThreadIdGen::class) threadId: Int) {
+        m.acquireWrite()
+        assert(!writeLockAcquired[threadId]) { "The mutex is not reentrant" }
+        writeLockAcquired[threadId] = true
+    }
+
+//    @Operation
+    fun tryAcquireWrite(@Param(gen = ThreadIdGen::class) threadId: Int) =  m.tryAcquireWrite().also { acquired ->
+        if (acquired) {
+            assert(!writeLockAcquired[threadId]) { "The mutex is not reentrant" }
+            writeLockAcquired[threadId] = true
+        }
+    }
+
+    @Operation
+    fun releaseRead(@Param(gen = ThreadIdGen::class) threadId: Int): Boolean {
+        if (readLockAcquired[threadId] == 0) return false
+        m.releaseRead()
+        readLockAcquired[threadId]--
+        return true
+    }
+
+    @Operation
+    fun releaseWrite(@Param(gen = ThreadIdGen::class) threadId: Int): Boolean {
+        if (!writeLockAcquired[threadId]) return false
+        m.releaseWrite()
+        writeLockAcquired[threadId] = false
+        return true
+    }
+
+    @Test
+    fun test() = LCStressOptionsDefault()
+        .actorsBefore(0)
+        .actorsAfter(0)
+        .threads(3)
+        .actorsPerThread(3)
+        .invocationsPerIteration(500_000)
+        .logLevel(LoggingLevel.INFO)
+        .sequentialSpecification(ReadWriteMutexSequential::class.java)
+        .check(this::class)
+
+//    @Test
+//    fun test() = ModelCheckingOptions()
+//        .iterations(20)
+//        .actorsBefore(0)
+//        .actorsAfter(0)
+//        .threads(3)
+//        .actorsPerThread(3)
+//        .logLevel(LoggingLevel.INFO)
+//        .invocationsPerIteration(100_000)
+//        .sequentialSpecification(ReadWriteMutexSequential::class.java)
+//        .check(this::class)
+
+//    @StateRepresentation
+//    fun stateRepresentation() = m.toString()
+}
+
+class CustomGen(testConfiguration: CTestConfiguration?, testStructure: CTestStructure?) :
+    ExecutionGenerator(testConfiguration, testStructure) {
+
+    @Suppress("")
+    override fun nextExecution() = ExecutionScenario(
+        emptyList(),
+        listOf(
+            listOf(
+                Actor(ReadWriteMutexLCStressTest::acquireRead.javaMethod!!, listOf(1), emptyList(), true, true),
+                Actor(ReadWriteMutexLCStressTest::acquireWrite.javaMethod!!, listOf(1), emptyList(), true, true)
+//                Actor(ReadWriteMutexLCStressTest::acquireRead.javaMethod!!, listOf(1), emptyList(), true, true)
+            )
+        ),
+        emptyList()
+    )
+}
+
 class ReadWriteMutexSequential : VerifierState() {
     private var activeReaders = 0
     private var writeLockedOrWaiting = false
     private val waitingReaders = ArrayList<CancellableContinuation<Unit>>()
     private val waitingWriters = ArrayList<CancellableContinuation<Unit>>()
+    // Thread-local info
+    private val readLockAcquired = IntArray(6)
+    private val writeLockAcquired = BooleanArray(6)
 
-    suspend fun acquireRead() {
+    suspend fun acquireRead(threadId: Int) {
         if (writeLockedOrWaiting) {
             suspendAtomicCancellableCoroutine<Unit> { cont ->
                 waitingReaders.add(cont)
@@ -550,9 +688,18 @@ class ReadWriteMutexSequential : VerifierState() {
         } else {
             activeReaders++
         }
+        readLockAcquired[threadId]++
     }
 
-    suspend fun acquireWrite() {
+    fun tryAcquireRead(threadId: Int): Boolean {
+        return if (!writeLockedOrWaiting) {
+            activeReaders++
+            readLockAcquired[threadId]++
+            true
+        } else false
+    }
+
+    suspend fun acquireWrite(threadId: Int) {
         if (activeReaders > 0 || writeLockedOrWaiting) {
             writeLockedOrWaiting = true
             suspendAtomicCancellableCoroutine<Unit> { cont ->
@@ -561,74 +708,50 @@ class ReadWriteMutexSequential : VerifierState() {
         } else {
             writeLockedOrWaiting = true
         }
+        writeLockAcquired[threadId] = true
     }
 
-    fun releaseRead() {
-        check(activeReaders > 0) { "Read lock is not acquired" }
+    fun tryAcquireWrite(threadId: Int): Boolean {
+        return if (!writeLockedOrWaiting && activeReaders == 0) {
+            writeLockedOrWaiting = true
+            writeLockAcquired[threadId] = true
+            true
+        } else false
+    }
+
+    fun releaseRead(threadId: Int): Boolean {
+        if (readLockAcquired[threadId] == 0) return false
+        readLockAcquired[threadId]--
         activeReaders--
         if (activeReaders == 0 && writeLockedOrWaiting) {
-            val w = waitingWriters.removeAt(0)
-            w.resume(Unit)
-        }
-    }
-
-    fun releaseWrite() {
-        check(writeLockedOrWaiting && activeReaders == 0) { "Write lock is not acquired" }
-        if (waitingWriters.isNotEmpty()) {
-            val w = waitingWriters.removeAt(0)
-            w.resume(Unit)
-        } else {
+            while (waitingWriters.isNotEmpty()) {
+                val w = waitingWriters.removeAt(0)
+                if (w.tryResume0(Unit)) return true
+            }
             writeLockedOrWaiting = false
-            activeReaders = waitingReaders.size
-            waitingReaders.forEach { it.resume(Unit) }
+            val resumedReaders = waitingReaders.map { it.tryResume0(Unit) }.filter { it }.count()
             waitingReaders.clear()
+            activeReaders = resumedReaders
+            return true
         }
+        return true
     }
 
-    override fun extractState() = "$activeReaders + $writeLockedOrWaiting"
-}
+    fun releaseWrite(threadId: Int): Boolean {
+        if (!writeLockAcquired[threadId]) return false
+        writeLockAcquired[threadId] = false
+        while (waitingWriters.isNotEmpty()) {
+            val w = waitingWriters.removeAt(0)
+            if (w.tryResume0(Unit)) return true
+        }
+        writeLockedOrWaiting = false
+        val resumedReaders = waitingReaders.map { it.tryResume0(Unit) }.filter { it }.count()
+        waitingReaders.clear()
+        activeReaders = resumedReaders
+        return true
+    }
 
-class ReadWriteMutexLCStressTest {
-    private val m = ReadWriteMutex()
-
-    @Operation(cancellableOnSuspension = false, allowExtraSuspension = true)
-    suspend fun acquireRead() = m.acquireRead()
-
-    @Operation(cancellableOnSuspension = false, allowExtraSuspension = true)
-    suspend fun acquireWrite() = m.acquireWrite()
-
-    @Operation(handleExceptionsAsResult = [IllegalStateException::class])
-    fun releaseRead() = m.releaseRead()
-
-    @Operation(handleExceptionsAsResult = [IllegalStateException::class])
-    fun releaseWrite() = m.releaseWrite()
-
-    @Test
-    fun test2() = LCStressOptionsDefault()
-        .actorsBefore(0)
-        .actorsAfter(0)
-        .threads(3)
-        .actorsPerThread(4)
-        .invocationsPerIteration(100_000)
-        .logLevel(LoggingLevel.INFO)
-        .sequentialSpecification(ReadWriteMutexSequential::class.java)
-        .check(this::class)
-
-    @Test
-    fun test() = ModelCheckingOptions()
-        .iterations(20)
-        .actorsBefore(0)
-        .actorsAfter(0)
-        .threads(3)
-        .actorsPerThread(2)
-        .logLevel(LoggingLevel.INFO)
-//        .minimizeFailedScenario(false)
-        .invocationsPerIteration(100_000)
-        .sequentialSpecification(ReadWriteMutexSequential::class.java)
-        .check(this::class)
-
-    @StateRepresentation
-    fun stateRepresentation() = m.toString()
+    override fun extractState() = "$activeReaders, $writeLockedOrWaiting, ${readLockAcquired.contentToString()}, ${writeLockAcquired.contentToString()}"
 }
 
 // ##############
