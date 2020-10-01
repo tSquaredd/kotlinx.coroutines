@@ -16,7 +16,6 @@ import org.jetbrains.kotlinx.lincheck.*
 import org.jetbrains.kotlinx.lincheck.annotations.*
 import org.jetbrains.kotlinx.lincheck.annotations.Operation
 import org.jetbrains.kotlinx.lincheck.paramgen.*
-import org.jetbrains.kotlinx.lincheck.strategy.managed.modelchecking.*
 import org.jetbrains.kotlinx.lincheck.strategy.stress.*
 import org.jetbrains.kotlinx.lincheck.verifier.*
 import org.junit.Test
@@ -589,20 +588,20 @@ internal class ReadWriteMutexCounterLCStressTest {
         m.releaseRead()
     }
 
-    @StateRepresentation
-    fun stateRepresentation(): String = "$c+$m"
+//    @StateRepresentation
+//    fun stateRepresentation(): String = "$c+$m"
 
-    @Test
-    fun test2() = ModelCheckingOptions()
-        .iterations(50)
-        .actorsBefore(0)
-        .actorsAfter(0)
-        .threads(3)
-        .actorsPerThread(4)
-        .logLevel(LoggingLevel.INFO)
-        .invocationsPerIteration(100_000)
-        .sequentialSpecification(ReadWriteMutexCounterSequential::class.java)
-        .check(this::class)
+//    @Test
+//    fun test2() = ModelCheckingOptions()
+//        .iterations(50)
+//        .actorsBefore(0)
+//        .actorsAfter(0)
+//        .threads(3)
+//        .actorsPerThread(4)
+//        .logLevel(LoggingLevel.INFO)
+//        .invocationsPerIteration(100_000)
+//        .sequentialSpecification(ReadWriteMutexCounterSequential::class.java)
+//        .check(this::class)
 
     @Test
     fun test() = StressOptions()
