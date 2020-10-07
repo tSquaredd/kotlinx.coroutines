@@ -16,6 +16,7 @@ import org.jetbrains.kotlinx.lincheck.*
 import org.jetbrains.kotlinx.lincheck.annotations.*
 import org.jetbrains.kotlinx.lincheck.annotations.Operation
 import org.jetbrains.kotlinx.lincheck.paramgen.*
+import org.jetbrains.kotlinx.lincheck.strategy.managed.modelchecking.*
 import org.jetbrains.kotlinx.lincheck.strategy.stress.*
 import org.jetbrains.kotlinx.lincheck.verifier.*
 import org.junit.Test
@@ -36,7 +37,9 @@ import kotlin.reflect.*
  * This readers-writer mutex maintains two atomic variables [R] and [W], and uses two
  * separate [SegmentQueueSynchronizer]-s for waiting readers and writers. The 64-bit
  * variable [R] maintains three mostly readers-related states atomically:
- * - `WF` (writer's flag) bit that is `true` if there is a writer waiting for the write lock or holding it,
+ * - `AWF` (active writer flag) bit that is `true` if there is a writer holding the write lock.
+ * - `WWF` (waiting writer flag) bit that is `true` if there is a writer waiting for the write lock
+ *                               and the lock is not acquired due to active readers.
  * - `AR` (active readers) 30-bit counter which represents the number of coroutines holding a read lock,
  * - `WR` (waiting readers) 30-bit counter which represents the number of coroutines waiting for a
  *                          read lock in the corresponding [SegmentQueueSynchronizer].
@@ -72,41 +75,32 @@ internal class ReadWriteMutex {
 
     val sqsForWriters = object : SegmentQueueSynchronizer<Unit>() {
         override val resumeMode: ResumeMode get() = ASYNC
-        override val cancellationMode: CancellationMode get() = SIMPLE // TODO
+        override val cancellationMode: CancellationMode get() = SMART_ASYNC
 
         override fun onCancellation(): Boolean {
+            // Decrement the number of waiting writers
             while (true) {
                 val w = curW
                 if (w.ww == 0) return false
-                if (w.ww > 1 || w.wla) {
-                    // just decrement the number of waiting writers
+                if (w.ww > 1 || w.wla || w.wlrp) {
                     if (casW(w, constructW(w.ww - 1, w.wla, w.wlrp, w.wrf))) return true
                 } else {
-                    if (w.wlrp) return false
-                    if (casW(w, constructW(0, false, true, false))) {
-                    // Phase 2. Re-set the WF flag
-                    // and resume readers if needed.
-                    var activeReaders: Boolean
-                    while (true) {
-                        val r = R.value
-                        val wf = r.wf
-                        val ra = r.ar
-                        val rw = r.wr
-                        assert(wf) { "WF should be set here" }
-                        // Re-set the WF flag and resume the waiting readers logically.
-                        if (R.compareAndSet(r, constructR(false, rw + ra, 0))) {
-                            // Were there waiting readers?
-                            // Resume them physically if needed.
-                            repeat(rw) {
-                                val success = sqsForReaders.resume(Unit)
-                                assert(success) { "Reader resumption cannot fail because of the smart cancellation in the SQS" }
-                            }
-                            activeReaders = (ra + rw) > 0
-                            break
-                        }
-                    }
-                    // Phase 3. Try to re-set the WLRP flag
-                    // if there is no waiting writer.
+                    // w.ww == 1, w.wla == false, w.wlrp == false, w.wrf == false
+                    if (casW(w, constructW(1, false, true, false))) break
+                }
+            }
+            // The WLRP flag is successfully set.
+            // Re-set the WWF flag or complete if the AWF flag is set.
+            while (true) {
+                val r = R.value
+                val awf = r.awf
+                val wwf = r.wwf
+                val ar = r.ar
+                val wr = r.wr
+                assert(ar > 0 || awf) { "Either active writer or active reader should be here" }
+                // Should this last cancelled waiting writer be resumed by the last reader?
+                if (awf) {
+                    // Re-set the WLRP flag
                     while (true) {
                         val w = W.value
                         val ww = w.ww
@@ -114,55 +108,89 @@ internal class ReadWriteMutex {
                         val wlrp = w.wlrp
                         val wrf = w.wrf
                         assert(wlrp) { "WLRP flag should still be set" }
-                        assert(!wla) { "There should be no active writer at this point: $this" }
-//                        assert(!wrf) { "WRF flag can be set only when the WF flag is put back"}
-                        // Is there a waiting writer?
-                        if (ww != 0 && !activeReaders) break
-                        // No waiting writers, try
-                        // to complete immediately.
-                        val updW = constructW(0, false, false, false)
-                        if (W.compareAndSet(w, updW)) return true
-                    }
-                        // Phase 4. There is a waiting writer,
-                        // set the WF flag back and try to grab
-                        // the write lock.
-                        var acquired = false
-                        while (true) {
-                            val r = R.value
-                            val wf = r.wf
-                            val ar = r.ar
-                            val wr = r.wr
-                            assert(!wf) { "The WF flag should not be set at this point" }
-                            assert(wr == 0) { "The number of waiting readers shold be 0 when the WF flag is not set" }
-                            val updR = constructR(true, ar, 0)
-                            // Try to set the WF flag.
-                            if (!R.compareAndSet(r, updR)) continue
-                            // Check whether the write lock is acquired.
-                            if (ar == 0) acquired = true
-                            break
-                        }
-                        // Phase 5. Re-set the WLRP flag and try to resume
-                        // the next waiting writer if the write lock is grabbed.
-                        while (true) {
-                            val w = W.value
-                            val ww = w.ww
-                            val wla = w.wla
-                            val wlrp = w.wlrp
-                            val wrf = w.wrf
-                            assert(ww > 0) { "WW cannot decrease without resumptions" }
-                            check(wlrp) { "WLRP flag should still be set" }
-                            assert(!wla) { "WLA cannot be set here" }
-                            val resume = acquired || wrf
-                            val updW = constructW(if (resume) ww - 1 else ww, resume, false, false)
-                            if (W.compareAndSet(w, updW)) {
-                                if (resume) {
-                                    if (!resume(Unit)) releaseWrite()
+                        assert(!wla) { "WLA cannot be set here" }
+                        if (wrf) {
+                            // Are we the last waiting writer?
+                            if (ww == 1) {
+                                val updW = constructW(0, true, false, false)
+                                if (W.compareAndSet(w, updW)) return false
+                            } else {
+                                val updW = constructW(ww - 2, true, false, false)
+                                if (W.compareAndSet(w, updW)) {
+                                    resume(Unit)
+                                    return true
                                 }
-                                return true
                             }
+                        } else {
+                            assert(ww > 0) { "Our cancelling writer should still be counted" }
+                            val updW = constructW(ww, false, false, false)
+                            if (W.compareAndSet(w, updW)) return true
                         }
                     }
                 }
+                // Try to reset the WWF flag and resume waiting readers.
+                if (R.compareAndSet(r, constructR(false, false, ar + wr, 0))) {
+                    // Were there waiting readers?
+                    // Resume them physically if needed.
+                    repeat(wr) {
+                        val success = sqsForReaders.resume(Unit)
+                        assert(success) { "Reader resumption cannot fail because of the smart cancellation in the SQS" }
+                    }
+                    break
+                }
+            }
+            // Check whether the AWF or WWF flag should be set back due to new waiting writers.
+            // Phase 3. Try to re-set the WLRP flag
+            // if there is no waiting writer.
+            while (true) {
+                val w = W.value
+                val ww = w.ww
+                val wla = w.wla
+                val wlrp = w.wlrp
+                val wrf = w.wrf
+                assert(wlrp) { "WLRP flag should still be set" }
+                assert(!wla) { "There should be no active writer at this point: $this" }
+                assert(!wrf) { "WRF flag can be set only when the WF flag is put back"}
+                // Is there a waiting writer?
+                if (ww > 1) break
+                // No waiting writers, try
+                // to complete immediately.
+                val updW = constructW(0, false, false, false)
+                if (W.compareAndSet(w, updW)) return true
+            }
+            // Phase 4. There is a waiting writer,
+            // set the WF flag back and try to grab
+            // the write lock.
+            var acquired: Boolean
+            while (true) {
+                val r = R.value
+                val awf = r.awf
+                val wwf = r.wwf
+                val ar = r.ar
+                val wr = r.wr
+                assert(!awf && !wwf) { "The WF flag should not be set at this point" }
+                assert(wr == 0) { "The number of waiting readers shold be 0 when the WF flag is not set" }
+                acquired = ar == 0
+                val updR = constructR(acquired, !acquired, ar, 0)
+                // Try to set the WF flag.
+                if (R.compareAndSet(r, updR)) break
+            }
+            // Phase 5. Re-set the WLRP flag and try to resume
+            // the next waiting writer if the write lock is grabbed.
+            while (true) {
+                val w = W.value
+                val ww = w.ww
+                val wla = w.wla
+                val wlrp = w.wlrp
+                val wrf = w.wrf
+                assert(ww > 0) { "WW cannot decrease without resumptions" }
+                assert(wlrp) { "WLRP flag should still be set" }
+                assert(!wla) { "WLA cannot be set here" }
+                val resume = acquired || wrf
+                val updW = constructW(if (resume) ww - 1 else ww, resume, false, false)
+                if (!W.compareAndSet(w, updW)) continue
+                if (resume) resume(Unit)
+                return true
             }
         }
 
@@ -185,7 +213,7 @@ internal class ReadWriteMutex {
             while (true) {
                 val r = curR
                 if (r.wr == 0) return false
-                if (casR(r, constructR(r.wf, r.ar, r.wr - 1))) {
+                if (casR(r, constructR(r.awf, r.wwf, r.ar, r.wr - 1))) {
                     return true
                 }
             }
@@ -199,19 +227,20 @@ internal class ReadWriteMutex {
 
     suspend fun acquireRead(): Unit = R.loop { r ->
         // Read the current [R] state.
-        val wf = r.wf
+        val awf = r.awf
+        val wwf = r.wwf
         val ar = r.ar
         val wr = r.wr
         // Is there an active or waiting writer?
-        if (!wf) {
+        if (!awf && !wwf) {
             // There is no writer, try to grab a read lock!
             assert(wr == 0)
-            val upd = constructR(wf, ar + 1, wr)
+            val upd = constructR(false, false, ar + 1, 0)
             if (R.compareAndSet(r, upd)) return
         } else {
             // This reader should wait for a lock, try to
             // increment the number of waiting readers and suspend.
-            val upd = constructR(wf, ar, wr + 1)
+            val upd = constructR(awf, wwf, ar, wr + 1)
             if (R.compareAndSet(r, upd)) {
                 suspendAtomicCancellableCoroutine<Unit> { sqsForReaders.suspend(it) }
                 return
@@ -231,40 +260,32 @@ internal class ReadWriteMutex {
             // [releaseWrite] invocation is in progress.
             if (wla || wlrp) {
                 // Try to suspend and re-try the whole operation on failure.
-                var failed = false
                 suspendAtomicCancellableCoroutine<Unit> { cont ->
-                    if (!sqsForWriters.suspend(cont)) {
-                        cont.resume(Unit)
-                        failed = true
-                    }
+                    sqsForWriters.suspend(cont)
                 }
-                if (failed) continue@try_again
                 return
             }
             // This writer is the first one. Set the `WF` flag and
             // complete immediately if there is no reader.
             while (true) {
                 val r = R.value
-                val wf = r.wf
+                val awf = r.awf
+                val wwf = r.wwf
                 val ar = r.ar
                 val wr = r.wr
-                if (wf) {
+                if (awf || wwf) {
                     // Try to suspend and re-try the whole operation on failure.
-                    var failed = false
                     suspendAtomicCancellableCoroutine<Unit> { cont ->
-                        if (!sqsForWriters.suspend(cont)) {
-                            cont.resume(Unit)
-                            failed = true
-                        }
+                        sqsForWriters.suspend(cont)
                     }
-                    if (failed) continue@try_again
                     return
                 }
-                assert(!wf) { "WF flag should not be set at this point: $this" }
                 assert(wr == 0) { "The number of waiting readers should be 0 when the WF flag is not set"}
-                if (R.compareAndSet(r, constructR(true, ar, wr))) {
+                val acquired = ar == 0
+                val rUpd = constructR(acquired, !acquired, ar, wr)
+                if (R.compareAndSet(r, rUpd)) {
                     // Is the lock acquired? Check the number of readers.
-                    if (ar == 0) {
+                    if (acquired) {
                         // Yes! The write lock is just acquired!
                         // Update `W` correspondingly.
                         W.update { w1 ->
@@ -282,14 +303,9 @@ internal class ReadWriteMutex {
                     // Try to suspend and re-try the whole operation on failure.
                     // Note, that the thread that fails on resumption should
                     // re-set the WF flag if required.
-                    var failed = false
                     suspendAtomicCancellableCoroutine<Unit> { cont ->
-                        if (!sqsForWriters.suspend(cont)) {
-                            cont.resume(Unit)
-                            failed = true
-                        }
+                        sqsForWriters.suspend(cont)
                     }
-                    if (failed) continue@try_again
                     return
                 }
             }
@@ -300,52 +316,50 @@ internal class ReadWriteMutex {
         while (true) {
             // Read the current [R] state
             val r = R.value
-            val wf = r.wf
+            val wwf = r.wwf
             val ra = r.ar
-            val rw = r.wr
-            check(ra > 0) { "No active reader to release" }
+            val wr = r.wr
+            assert(ra > 0) { "No active reader to release" }
+            assert(!r.awf) { "Write lock cannot be acquired when there is an active reader" }
             // Try to decrement the number of active readers
-            val upd = constructR(wf, ra - 1, rw)
+            val awfUpd = wwf && ra == 1
+            val wwfUpd = wwf && !awfUpd
+            val upd = constructR(awfUpd, wwfUpd, ra - 1, wr)
             if (!R.compareAndSet(r, upd)) continue
             // Check whether the current reader is the last one,
             // and resume the first writer if the `WF` flag is set.
-            if (ra == 1 && wf) onLastReadRelease()
-            return
-        }
-    }
-
-    // TODO rename me
-    private fun onLastReadRelease() {
-        while (true) {
-            // Either WLA, WLA or WLRP should be
-            // non-zero when the WF flag is set.
-            val w = W.value
-            val ww = w.ww
-            val wla = w.wla
-            val wlrp = w.wlrp
-            val wrf = w.wrf
-            assert(!wla) { "There should be no active writer at this point" }
-            assert(!wrf) { "The WRF flag cannot be set at this point" }
-            // Is there still a concurrent [releaseWrite]?
-            // Try to delegate the resumption work in this case.
-            if (wlrp) {
-                val updW = constructW(ww, false, true, true)
-                if (W.compareAndSet(w, updW)) return
-            } else {
-                if (ww == 0) return // cancellation is happening TODO
-                assert(ww > 0) { "At most one waiting writer should be registered at this point" }
-                // Try to set the `WLA` flag and decrement
-                // the number of waiting writers.
-                val updW = constructW(ww -1, true, false, false)
-                if (!W.compareAndSet(w, updW)) continue
-                // Try to resume the first waiting writer.
-                if (sqsForWriters.resume(Unit)) return
-                // The resumption fails. However, it can be
-                // processed as a successful write lock
-                // acquisition followed by a release
-                // invocation.
-                releaseWrite()
-                return
+            if (!awfUpd) return
+            while (true) {
+                // Either WLA, WLA or WLRP should be
+                // non-zero when the WF flag is set.
+                val w = W.value
+                val ww = w.ww
+                val wla = w.wla
+                val wlrp = w.wlrp
+                val wrf = w.wrf
+                assert(!wla) { "There should be no active writer at this point" }
+                assert(!wrf) { "The WRF flag cannot be set at this point" }
+                // Is there still a concurrent [releaseWrite]?
+                // Try to delegate the resumption work in this case.
+                if (wlrp) {
+                    val updW = constructW(ww, wla, true, true)
+                    if (W.compareAndSet(w, updW)) return
+                } else {
+                    if (ww == 0) return // cancellation is happening TODO
+                    assert(ww > 0) { "At most one waiting writer should be registered at this point" }
+                    // Try to set the `WLA` flag and decrement
+                    // the number of waiting writers.
+                    val updW = constructW(ww - 1, true, false, false)
+                    if (!W.compareAndSet(w, updW)) continue
+                    // Try to resume the first waiting writer.
+                    if (sqsForWriters.resume(Unit)) return
+                    // The resumption fails. However, it can be
+                    // processed as a successful write lock
+                    // acquisition followed by a release
+                    // invocation.
+                    releaseWrite()
+                    return
+                }
             }
         }
     }
@@ -359,7 +373,7 @@ internal class ReadWriteMutex {
             val wla = w.wla
             val wlrp = w.wlrp
             val wrf = w.wrf
-            check(wla) { "Write lock is not acquired" }
+            assert(wla) { "Write lock is not acquired" }
             assert(!wlrp && !wrf) { "WLRP and WRF flags should not be set in the beginning" }
             // Is there a waiting writer?
             if (ww > 0) {
@@ -372,35 +386,24 @@ internal class ReadWriteMutex {
                 if (W.compareAndSet(w, updW)) break
             }
         }
-        completeReleaseWrite()
-    }
-
-    private fun completeReleaseWrite() {
         // Phase 2. Re-set the WF flag
         // and resume readers if needed.
         while (true) {
             val r = R.value
-            val wf = r.wf
-            val ra = r.ar
-            val rw = r.wr
-            assert(ra == 0) { "There should be no active reader while the write lock is acquired" }
-            assert(wf) { "WF should be set here" }
+            val awf = r.awf
+            val wwf = r.wwf
+            val ar = r.ar
+            val wr = r.wr
+            assert(ar == 0) { "There should be no active reader while the write lock is acquired" }
+            assert(awf) { "AWF should be set here" }
+            assert(!wwf) { "WWF should not be set here" }
             // Re-set the WF flag and resume the waiting readers logically.
-            if (R.compareAndSet(r, constructR(false, rw, 0))) {
+            if (R.compareAndSet(r, constructR(false, false, wr, 0))) {
                 // Were there waiting readers?
                 // Resume them physically if needed.
-                if (rw > 0) {
-                    repeat(rw) {
-                        val success = sqsForReaders.resume(Unit)
-                        assert(success) { "Reader resumption cannot fail because of the smart cancellation in the SQS" }
-                    }
-//                    // Decrement the number of active readers
-//                    // on the number of failed resumptions.
-//                    val rUpd = R.updateAndGet { r1 ->
-//                        assert(!r1.wf) { "WF flag cannot be re-set while the WLRP is set" }
-//                        constructR(false, r1.ar - failedResumptions, r1.wr)
-//                    }
-//                    if (rw == 0 && wf) onLastReadRelease()
+                repeat(wr) {
+                    val success = sqsForReaders.resume(Unit)
+                    assert(success) { "Reader resumption cannot fail because of the smart cancellation in the SQS" }
                 }
                 break
             }
@@ -426,20 +429,19 @@ internal class ReadWriteMutex {
         // Phase 4. There is a waiting writer,
         // set the WF flag back and try to grab
         // the write lock.
-        var acquired = false
+        var acquired: Boolean
         while (true) {
             val r = R.value
-            val wf = r.wf
+            val awf = r.awf
+            val wwf = r.wwf
             val ar = r.ar
             val wr = r.wr
-            assert(!wf) { "The WF flag should not be set at this point" }
+            assert(!awf && !wwf) { "The WF flag should not be set at this point" }
             assert(wr == 0) { "The number of waiting readers shold be 0 when the WF flag is not set" }
-            val updR = constructR(true, ar, 0)
+            acquired = ar == 0
+            val updR = constructR(acquired, !acquired, ar, 0)
             // Try to set the WF flag.
-            if (!R.compareAndSet(r, updR)) continue
-            // Check whether the write lock is acquired.
-            if (ar == 0) acquired = true
-            break
+            if (R.compareAndSet(r, updR)) break
         }
         // Phase 5. Re-set the WLRP flag and try to resume
         // the next waiting writer if the write lock is grabbed.
@@ -449,38 +451,44 @@ internal class ReadWriteMutex {
             val wla = w.wla
             val wlrp = w.wlrp
             val wrf = w.wrf
-            assert(ww > 0) { "WW cannot decrease without resumptions" }
-            check(wlrp) { "WLRP flag should still be set" }
+            assert(wlrp) { "WLRP flag should still be set" }
             assert(!wla) { "WLA cannot be set here" }
             val resume = acquired || wrf
-            val updW = constructW(if (resume) ww - 1 else ww, resume, false, false)
-            if (W.compareAndSet(w, updW)) {
-                if (resume) {
-                    if (!sqsForWriters.resume(Unit)) releaseWrite()
-                }
+            if (resume && ww == 0) {
+                val updW = constructW(0, true, false, false)
+                if (!W.compareAndSet(w, updW)) continue
+                releaseWrite()
+                return
+            } else {
+                val updW = constructW(if (resume) ww - 1 else ww, resume, false, false)
+                if (!W.compareAndSet(w, updW)) continue
+                if (resume) sqsForWriters.resume(Unit)
                 return
             }
         }
     }
 
-    override fun toString() = "R=<${R.value.wf},${R.value.ar},${R.value.wr}>," +
+    override fun toString() = "R=<${R.value.awf},${R.value.wwf},${R.value.ar},${R.value.wr}>," +
         "W=<${W.value.ww},${W.value.wla},${W.value.wlrp},${W.value.wrf}>"
 
     companion object {
-        inline val Long.wf: Boolean get() = this and WF_BIT != 0L
-        const val WF_BIT = 1L shl 62
-        inline val Long.R_withWfBit: Long get() = this or WF_BIT
-        inline val Long.R_withoutWfBit: Long get() = R_withWfBit - WF_BIT
+        inline val Long.awf: Boolean get() = this and AWF_BIT != 0L
+        const val AWF_BIT = 1L shl 62
+
+        inline val Long.wwf: Boolean get() = this and WWF_BIT != 0L
+        const val WWF_BIT = 1L shl 61
 
         inline val Long.wr: Int get() = (this and WAITERS_MASK).toInt()
         const val WAITERS_MASK = (1L shl 30) - 1L
 
         inline val Long.ar: Int get() = ((this and ACTIVE_MASK) shr 30).toInt()
-        const val ACTIVE_MASK = (1L shl 61) - 1L - WAITERS_MASK
+        const val ACTIVE_MASK = (1L shl 60) - 1L - WAITERS_MASK
 
         @Suppress("NOTHING_TO_INLINE")
-        inline fun constructR(wf: Boolean, ar: Int, wr: Int): Long {
-            var res = if (wf) WF_BIT else 0
+        inline fun constructR(awf: Boolean, wwf: Boolean, ar: Int, wr: Int): Long {
+            var res = 0L
+            if (awf) res += AWF_BIT
+            if (wwf) res += WWF_BIT
             res += ar.toLong() shl 30
             res += wr.toLong()
             return res
@@ -546,7 +554,7 @@ internal class ReadWriteMutexTest : TestBase() {
     }
 
     @Test
-    fun `acquireRead suspend after cancelled acquireWrite`() = runTest {
+    fun `acquireRead does not suspend after cancelled acquireWrite`() = runTest {
         val m = ReadWriteMutex()
         m.acquireRead()
         val wJob = launch {
@@ -557,14 +565,13 @@ internal class ReadWriteMutexTest : TestBase() {
         yield()
         expect(2)
         wJob.cancel()
-        val rJob = launch {
+        launch {
             expect(3)
             m.acquireRead()
-            expectUnreached()
+            expect(4)
         }
         yield()
-        rJob.cancel()
-        finish(4)
+        finish(5)
     }
 }
 
@@ -588,20 +595,20 @@ internal class ReadWriteMutexCounterLCStressTest {
         m.releaseRead()
     }
 
-//    @StateRepresentation
-//    fun stateRepresentation(): String = "$c+$m"
+    @StateRepresentation
+    fun stateRepresentation(): String = "$c+$m"
 
-//    @Test
-//    fun test2() = ModelCheckingOptions()
-//        .iterations(50)
-//        .actorsBefore(0)
-//        .actorsAfter(0)
-//        .threads(3)
-//        .actorsPerThread(4)
-//        .logLevel(LoggingLevel.INFO)
-//        .invocationsPerIteration(100_000)
-//        .sequentialSpecification(ReadWriteMutexCounterSequential::class.java)
-//        .check(this::class)
+    @Test
+    fun test2() = ModelCheckingOptions()
+        .iterations(50)
+        .actorsBefore(0)
+        .actorsAfter(0)
+        .threads(2)
+        .actorsPerThread(3)
+        .logLevel(LoggingLevel.INFO)
+        .invocationsPerIteration(100_000)
+        .sequentialSpecification(ReadWriteMutexCounterSequential::class.java)
+        .check(this::class)
 
     @Test
     fun test() = StressOptions()
@@ -634,7 +641,7 @@ class ReadWriteMutexLCStressTest {
         readLockAcquired[threadId]++
     }
 
-    @Operation(cancellableOnSuspension = false, allowExtraSuspension = true)
+    @Operation(cancellableOnSuspension = true, allowExtraSuspension = true)
     suspend fun acquireWrite(@Param(gen = ThreadIdGen::class) threadId: Int) {
         m.acquireWrite()
         assert(!writeLockAcquired[threadId]) { "The mutex is not reentrant" }
@@ -662,23 +669,23 @@ class ReadWriteMutexLCStressTest {
         .actorsBefore(0)
         .actorsAfter(0)
         .threads(3)
-        .actorsPerThread(3)
+        .actorsPerThread(5)
         .invocationsPerIteration(500_000)
         .logLevel(LoggingLevel.INFO)
         .sequentialSpecification(ReadWriteMutexSequential::class.java)
         .check(this::class)
 
-//    @Test
-//    fun test() = ModelCheckingOptions()
-//        .iterations(20)
-//        .actorsBefore(0)
-//        .actorsAfter(0)
-//        .threads(3)
-//        .actorsPerThread(3)
-//        .logLevel(LoggingLevel.INFO)
-//        .invocationsPerIteration(100_000)
-//        .sequentialSpecification(ReadWriteMutexSequential::class.java)
-//        .check(this::class)
+    @Test
+    fun test2() = ModelCheckingOptions()
+        .iterations(50)
+        .actorsBefore(0)
+        .actorsAfter(0)
+        .threads(3)
+        .actorsPerThread(3)
+        .logLevel(LoggingLevel.INFO)
+        .invocationsPerIteration(500_000)
+        .sequentialSpecification(ReadWriteMutexSequential::class.java)
+        .check(this::class)
 
 //    @StateRepresentation
 //    fun stateRepresentation() = m.toString()
@@ -697,6 +704,9 @@ class ReadWriteMutexSequential : VerifierState() {
         if (writeLockedOrWaiting) {
             suspendAtomicCancellableCoroutine<Unit> { cont ->
                 waitingReaders.add(cont)
+                cont.invokeOnCancellation {
+                    waitingReaders.remove(cont)
+                }
             }
         } else {
             activeReaders++
@@ -709,6 +719,15 @@ class ReadWriteMutexSequential : VerifierState() {
             writeLockedOrWaiting = true
             suspendAtomicCancellableCoroutine<Unit> { cont ->
                 waitingWriters.add(cont)
+                cont.invokeOnCancellation {
+                    waitingWriters.remove(cont)
+                    if (waitingWriters.isEmpty() && writeLockAcquired.all { !it }) {
+                        writeLockedOrWaiting = false
+                        activeReaders += waitingReaders.size
+                        waitingReaders.forEach { it.resume(Unit) }
+                        waitingReaders.clear()
+                    }
+                }
             }
         } else {
             writeLockedOrWaiting = true
