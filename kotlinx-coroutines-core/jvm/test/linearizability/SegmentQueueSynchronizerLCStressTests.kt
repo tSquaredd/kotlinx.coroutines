@@ -97,7 +97,7 @@ internal class ReadWriteMutex {
                 val wwf = r.wwf
                 val ar = r.ar
                 val wr = r.wr
-                assert(ar > 0 || awf) { "Either active writer or active reader should be here" }
+                assert(ar > 0 && wwf || awf) { "Either active writer or active reader should be here" }
                 // Should this last cancelled waiting writer be resumed by the last reader?
                 if (awf) {
                     // Re-set the WLRP flag
@@ -352,12 +352,7 @@ internal class ReadWriteMutex {
                     val updW = constructW(ww - 1, true, false, false)
                     if (!W.compareAndSet(w, updW)) continue
                     // Try to resume the first waiting writer.
-                    if (sqsForWriters.resume(Unit)) return
-                    // The resumption fails. However, it can be
-                    // processed as a successful write lock
-                    // acquisition followed by a release
-                    // invocation.
-                    releaseWrite()
+                    sqsForWriters.resume(Unit)
                     return
                 }
             }
