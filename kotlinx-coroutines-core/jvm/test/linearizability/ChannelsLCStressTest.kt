@@ -11,11 +11,11 @@ import kotlinx.coroutines.channels.Channel.Factory.CONFLATED
 import kotlinx.coroutines.channels.Channel.Factory.RENDEZVOUS
 import kotlinx.coroutines.channels.Channel.Factory.UNLIMITED
 import kotlinx.coroutines.selects.*
+import org.jetbrains.kotlinx.lincheck.*
 import org.jetbrains.kotlinx.lincheck.annotations.*
 import org.jetbrains.kotlinx.lincheck.annotations.Operation
 import org.jetbrains.kotlinx.lincheck.paramgen.*
 import org.jetbrains.kotlinx.lincheck.verifier.*
-import org.junit.*
 
 class RendezvousChannelLCStressTest : ChannelLCStressTestBase(
     c = Channel(RENDEZVOUS),
@@ -51,7 +51,10 @@ class SequentialConflatedChannel : SequentialIntChannelBase(CONFLATED)
     Param(name = "value", gen = IntGen::class, conf = "1:5"),
     Param(name = "closeToken", gen = IntGen::class, conf = "1:3")
 )
-abstract class ChannelLCStressTestBase(private val c: Channel<Int>, private val sequentialSpecification: Class<*>) {
+abstract class ChannelLCStressTestBase(
+    private val c: Channel<Int>,
+    private val sequentialSpecification: Class<*>
+) : AbstractLincheckTest() {
     @Operation
     suspend fun send(@Param(name = "value") value: Int): Any = try {
         c.send(value)
@@ -113,11 +116,8 @@ abstract class ChannelLCStressTestBase(private val c: Channel<Int>, private val 
     // @Operation
     fun isEmpty() = c.isEmpty
 
-    @Test
-    fun test() = LCStressOptionsDefault()
-        .actorsBefore(0)
-        .sequentialSpecification(sequentialSpecification)
-        .check(this::class)
+    override fun <O : Options<O, *>> O.customize(isStressTest: Boolean): O =
+        actorsBefore(0).sequentialSpecification(sequentialSpecification)
 }
 
 private class NumberedCancellationException(number: Int) : CancellationException() {
